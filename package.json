@@ -1,0 +1,37 @@
+{
+  "name": "uu-bus-erp",
+  "version": "1.0.0",
+  "description": "United University bus verification: QR boarding, student verification with selfie, live admin dashboard (React + Express + Node, SQLite/Turso)",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server/index.js",
+    "dev": "node --disable-warning=ExperimentalWarning --watch server/index.js",
+    "dev:client": "vite",
+    "build": "vite build",
+    "reset-admin": "node --disable-warning=ExperimentalWarning scripts/reset-admin.js",
+    "backup": "node --disable-warning=ExperimentalWarning scripts/backup.js",
+    "test:security": "node --disable-warning=ExperimentalWarning scripts/security-test.mjs"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0",
+    "express": "^5.1.0",
+    "express-rate-limit": "^8.0.1",
+    "helmet": "^8.1.0",
+    "qrcode": "^1.5.4",
+    "serverless-http": "^4.0.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.3",
+    "@vitejs/plugin-react": "6.1.2",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "read-excel-file": "9.3.12",
+    "tailwindcss": "4.3.3",
+    "vite": "8.3.4"
+  }
+}

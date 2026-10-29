@@ -1,0 +1,479 @@
+/**
+ * End-to-end security test. Run it against a RUNNING local server:
+ *   npm start                                         (in one terminal)
+ *   ADMIN_PW=<admin password> npm run test:security   (in another)
+ * Optional: BASE=http://localhost:3000
+ * It creates its own test buses (12 and 13) and students, simulates different phones with separate
+ * cookie jars, and creates/removes its own temporary staff accounts. Safe to re-run.
+ */
+import { tokenFor, dayTokenFor } from '../server/services/qr.js';
+import { autoEndStaleTrips } from '../server/services/trips.js';
+import { get, run } from '../server/db.js';
+
+const BASE = (process.env.BASE || 'http://localhost:3000').replace(/\/+$/, '');
+const ADMIN_PW = process.env.ADMIN_PW;
+if (!ADMIN_PW) { console.error('Set ADMIN_PW=<admin password>'); process.exit(2); }
+
+let pass = 0;
+let fail = 0;
+const ok = (cond, label, extra = '') => { if (cond) { pass++; console.log(`  PASS ${label}`); } else { fail++; console.log(`  FAIL ${label} ${extra}`); } };
+
+function jar() {
+  const c = {};
+  return {
+    headers() { const s = Object.entries(c).map(([k, v]) => `${k}=${v}`).join('; '); return s ? { Cookie: s } : {}; },
+    absorb(res) {
+      for (const h of res.headers.getSetCookie?.() || []) {
+        const [kv] = h.split(';');
+        const i = kv.indexOf('=');
+        const k = kv.slice(0, i).trim();
+        const v = kv.slice(i + 1).trim();
+        if (/Max-Age=0/i.test(h)) delete c[k]; else c[k] = v;
+      }
+    },
+  };
+}
+async function call(j, method, path, body, extra = {}) {
+  const res = await fetch(BASE + path, { method, headers: { 'Content-Type': 'application/json', ...j.headers(), ...extra }, body: body ? JSON.stringify(body) : undefined });
+  j.absorb(res);
+  let data = null;
+  try { data = await res.json(); } catch { /* not json */ }
+  return { status: res.status, data };
+}
+
+// ---------------------------------------------------------------- sign in + reset state
+const admin = jar();
+let r = await call(admin, 'POST', '/api/auth/login', { username: 'admin', password: ADMIN_PW });
+if (r.status !== 200) { console.error('admin login failed:', r.data); process.exit(2); }
+ok(true, 'admin login');
+const csrf = { 'X-CSRF-Token': r.data.csrf, Origin: BASE };
+const LIVE = r.data.live;
+console.log(`  (server live mode: ${LIVE})`);
+
+// test data: bus 12 with five students and bus 13 with two (created or refreshed through the CSV import)
+r = await call(admin, 'POST', '/api/admin/students/import', { csv: [
+  'uuid,name,course,year,bus,stop',
+  'SEC12-001,Aditi Test Sharma,B.Tech,2nd,12,Civil Lines',
+  'SEC12-002,Rahul Test Verma,BCA,1st,12,Civil Lines',
+  'SEC12-003,Priya Test Singh,MBA,1st,12,Naini',
+  'SEC12-004,Arjun Test Yadav,B.Sc,3rd,12,Naini',
+  'SEC12-005,Neha Test Gupta,BBA,2nd,12,Naini',
+  'SEC13-001,Tanvi Test Mishra,B.Tech,1st,13,Jhunsi',
+  'SEC13-002,Kabir Test Rai,BCA,2nd,13,Jhunsi',
+].join('\n') }, csrf);
+if (r.status !== 200) { console.error('could not create test data:', r.data); process.exit(2); }
+const allBuses = (await call(admin, 'GET', '/api/admin/buses')).data.buses.filter((b) => b.active);
+const bus12 = allBuses.find((b) => b.number === '12');
+const otherBus = allBuses.find((b) => b.number === '13');
+const state0 = await call(admin, 'GET', '/api/incharge/state');
+for (const t of state0.data.activeTrips.filter((t) => t.bus_number === '12')) await call(admin, 'POST', `/api/incharge/trips/${t.id}/end`, {}, csrf);
+
+// four students of bus 12 and one from another bus, as [uuid, name]; phones unlinked so the run is repeatable
+const pick = async (busId, n) => (await call(admin, 'GET', `/api/admin/students?bus=${busId}&active=1&limit=${n}`)).data.items.slice(0, n);
+const on12 = await pick(bus12.id, 4);
+const onOther = await pick(otherBus.id, 1);
+if (on12.length < 4 || onOther.length < 1) { console.error('test students missing'); process.exit(2); }
+const S = { aditi: [on12[0].uuid, on12[0].name], rahul: [on12[1].uuid, on12[1].name], priya: [on12[2].uuid, on12[2].name], arjun: [on12[3].uuid, on12[3].name], tanvi: [onOther[0].uuid, onOther[0].name] };
+const ids = { aditi: on12[0].id, rahul: on12[1].id, priya: on12[2].id, arjun: on12[3].id, tanvi: onOther[0].id };
+for (const id of Object.values(ids)) await call(admin, 'POST', `/api/admin/students/${id}/devices/reset`, {}, csrf);
+// remove earlier runs' selfies, so the first verification asks for one again
+for (const s of [...on12, ...onOther]) {
+  if (s.photo_url) await call(admin, 'PUT', `/api/admin/students/${s.id}`, { uuid: s.uuid, enrollment_no: s.enrollment_no, name: s.name, photo_url: '', course: s.course, year: s.year, specialization: s.specialization, bus_id: s.bus_id, stop_id: s.stop_id, phone: s.phone, active: !!s.active }, csrf);
+}
+// a stand-in selfie: a JPEG header and padding (the server checks type and size, not the picture)
+const SELFIE = `data:image/jpeg;base64,${Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(3000, 7)]).toString('base64')}`;
+const users = (await call(admin, 'GET', '/api/admin/users')).data.items;
+for (const u of users.filter((x) => ['locktest', 'testincharge12', 'testinchargex', 'testoperator'].includes(x.username))) await call(admin, 'DELETE', `/api/admin/users/${u.id}`, undefined, csrf);
+
+console.log('\n[buses]');
+ok(bus12.stops.length > 0 && otherBus.stops.length > 0, 'test buses 12 and 13 exist with their routes');
+r = await call(admin, 'POST', '/api/admin/buses', { number: 'NOCSRF', name: 'x' });
+ok(r.status === 403 && r.data.code === 'CSRF', 'changes need the CSRF token', r.status);
+// pages are the React app; the access rules live in the API
+r = await call(admin, 'GET', '/api/incharge/state?bus=12');
+ok(r.status === 200 && r.data.scopedBus?.number === '12', 'admin can open the bus 12 portal');
+r = await call(admin, 'GET', '/api/incharge/state?bus=does-not-exist');
+ok(r.status === 404, 'unknown bus portal -> 404', r.status);
+r = await call(jar(), 'GET', '/api/incharge/state?bus=12');
+ok(r.status === 401, 'portal without login -> 401', r.status);
+const page = await fetch(`${BASE}/bus/12`);
+ok(page.status === 200 && (await page.text()).includes('id="root"'), 'portal page is served by the web app');
+
+// ---------------------------------------------------------------- auth & csrf
+console.log('\n[auth & csrf]');
+r = await call(jar(), 'GET', '/api/admin/dashboard');
+ok(r.status === 401, 'admin API without session -> 401', r.status);
+r = await call(admin, 'POST', '/api/admin/buses', { number: 'X', name: 'x' });
+ok(r.status === 403 && r.data.code === 'CSRF', 'state change without CSRF header -> 403', r.status);
+r = await call(admin, 'POST', '/api/admin/buses', { number: 'X', name: 'x' }, { ...csrf, Origin: 'http://evil.example' });
+ok(r.status === 403 && r.data.code === 'ORIGIN', 'cross-origin POST -> 403', r.status);
+r = await call(admin, 'POST', '/api/auth/login', { username: 'admin', password: "x' OR 1=1 --" });
+ok(r.status === 401, 'injection-style password rejected');
+// a throw-away bus admin for bus 12 (bus admins keep the password the super admin gives them)
+r = await call(admin, 'POST', '/api/admin/users', { username: 'testincharge12', name: 'Test Incharge 12', role: 'incharge', bus_id: bus12.id, password: 'TempIncharge123' }, csrf);
+const testInchargeId = r.data.id;
+let inch = jar();
+r = await call(inch, 'POST', '/api/auth/login', { username: 'testincharge12', password: 'TempIncharge123' });
+ok(r.status === 200 && r.data.user.role === 'incharge' && r.data.user.home === '/bus/12' && !r.data.user.mustChangePassword && !r.data.user.canChangePassword, 'bus admin login lands on /bus/12 with no forced password change');
+let icsrf = { 'X-CSRF-Token': r.data?.csrf, Origin: BASE };
+r = await call(inch, 'POST', '/api/auth/change-password', { current: 'TempIncharge123', next: 'Incharge12fresh' }, icsrf);
+ok(r.status === 403 && r.data.code === 'PASSWORD_BY_ADMIN_ONLY', 'bus admin cannot change their own password -> 403', r.status);
+r = await call(admin, 'POST', `/api/admin/users/${testInchargeId}/password`, { password: 'Incharge12fresh' }, csrf);
+ok(r.status === 200 && r.data.generated === false, 'super admin sets the bus admin password');
+r = await call(inch, 'GET', '/api/incharge/state?bus=12');
+ok(r.status === 401, 'setting a password signs the bus admin out everywhere', r.status);
+r = await call(inch, 'POST', '/api/auth/login', { username: 'testincharge12', password: 'TempIncharge123' });
+ok(r.status === 401, 'old bus admin password no longer works');
+inch = jar();
+r = await call(inch, 'POST', '/api/auth/login', { username: 'testincharge12', password: 'Incharge12fresh' });
+ok(r.status === 200, 'bus admin signs in with the password the super admin set');
+icsrf = { 'X-CSRF-Token': r.data?.csrf, Origin: BASE };
+r = await call(admin, 'POST', `/api/admin/users/${(await call(admin, 'GET', '/api/admin/users')).data.items.find((x) => x.username === 'admin')?.id}/password`, {}, csrf);
+ok(r.status === 400, 'super admin cannot reset their own password from the staff list', r.status);
+r = await call(admin, 'GET', `/api/admin/users/${testInchargeId}/password`);
+ok(r.status === 200 && r.data.password === 'Incharge12fresh', 'super admin can view the bus admin password they set', r.status);
+r = await call(admin, 'GET', '/api/admin/users');
+ok(r.data.items.find((x) => x.id === testInchargeId)?.password_viewable === 1 && !('password_view' in r.data.items[0]) && !('password_hash' in r.data.items[0]), 'staff list says it is viewable without exposing any password data');
+r = await call(admin, 'POST', `/api/admin/users/${testInchargeId}/password`, {}, csrf);
+const generatedPw = r.data.password;
+r = await call(admin, 'GET', `/api/admin/users/${testInchargeId}/password`);
+ok(r.status === 200 && generatedPw && r.data.password === generatedPw, 'a generated password can be viewed too');
+r = await call(admin, 'POST', `/api/admin/users/${testInchargeId}/password`, { password: 'Incharge12fresh' }, csrf);
+r = await call(admin, 'GET', `/api/admin/users/${(await call(admin, 'GET', '/api/admin/users')).data.items.find((x) => x.username === 'admin')?.id}/password`);
+ok(r.status === 403 && r.data.code === 'NOT_VIEWABLE', 'super admin passwords are never viewable', r.status);
+inch = jar();
+r = await call(inch, 'POST', '/api/auth/login', { username: 'testincharge12', password: 'Incharge12fresh' });
+icsrf = { 'X-CSRF-Token': r.data?.csrf, Origin: BASE };
+r = await call(inch, 'GET', `/api/admin/users/${testInchargeId}/password`);
+ok(r.status === 403, 'a bus admin cannot view passwords (not even their own) -> 403', r.status);
+r = await call(admin, 'GET', '/api/admin/audit');
+ok(r.data.items.some((a) => a.action === 'user.password.view'), 'every password view is in the audit log');
+r = await call(inch, 'GET', '/api/incharge/state?bus=12');
+ok(r.status === 200 && r.data.scopedBus?.number === '12' && r.data.buses.length === 1, 'incharge sees only its own bus portal');
+r = await call(inch, 'GET', `/api/incharge/state?bus=${encodeURIComponent(otherBus.number)}`);
+ok(r.status === 403 && r.data.code === 'WRONG_BUS_PORTAL', 'incharge cannot open another bus portal -> 403', r.status);
+r = await call(inch, 'GET', '/api/incharge/buses');
+ok(r.status === 200 && r.data.buses.length === 1 && r.data.buses[0].number === '12', 'portal picker shows the incharge only its bus');
+// the web app sends an incharge who opens another bus back to their home portal
+r = await call(inch, 'GET', '/api/auth/me');
+ok(r.status === 200 && r.data.user.home === '/bus/12', "the incharge's home is the bus 12 portal", JSON.stringify(r.data?.user));
+r = await call(inch, 'POST', '/api/admin/buses', { number: 'INCH', name: 'x' }, icsrf);
+ok(r.status === 403, 'incharge cannot add buses -> 403', r.status);
+r = await call(inch, 'GET', '/api/admin/dashboard');
+ok(r.status === 403, 'incharge cannot open admin API -> 403', r.status);
+r = await call(inch, 'POST', '/api/incharge/trips', { bus_id: otherBus.id, direction: 'to_college' }, icsrf);
+ok(r.status === 403, 'incharge cannot start a trip for another bus -> 403', r.status);
+
+// ---------------------------------------------------------------- qr tokens (rotating mode)
+console.log('\n[qr token: rotating]');
+const ORIGINAL_QR_MODE = (await call(admin, 'GET', '/api/admin/settings')).data.qrMode;
+r = await call(admin, 'PUT', '/api/admin/settings', { qr_mode: 'rotating' }, csrf);
+ok(r.status === 200 && r.data.qrMode === 'rotating', 'admin switches QR to rotating');
+r = await call(inch, 'PUT', '/api/admin/settings', { qr_mode: 'day' }, icsrf);
+ok(r.status === 403, 'incharge cannot change the QR mode -> 403', r.status);
+r = await call(admin, 'POST', '/api/incharge/trips', { bus_id: bus12.id, direction: 'from_college' }, csrf);
+let trip = r.data.trip;
+ok(r.status === 201, 'start trip 1');
+const freshToken = async () => (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data.token;
+let tok = await freshToken();
+r = await call(jar(), 'POST', '/api/checkin/session', { token: tok.slice(0, -2) + 'zz' });
+ok(r.status === 410 && r.data.code === 'QR_EXPIRED', 'tampered token -> 410', r.status);
+const qrInfo = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+ok(/\/checkin\/12\?t=/.test(qrInfo.url), 'QR link carries the bus number (/checkin/12)', qrInfo.url);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: await freshToken(), bus: otherBus.number });
+ok(r.status === 410, 'bus 12 token presented on another bus link -> 410', r.status);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: await freshToken(), bus: '12' });
+ok(r.status === 200, 'bus 12 token on the bus 12 link -> ok', r.status);
+const rawTrip = await get('SELECT * FROM trips WHERE id = ?', trip.id);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: tokenFor(rawTrip, Date.now() - 120_000) });
+ok(r.status === 410, 'token from 2 minutes ago -> 410 (screenshots defeated)', r.status);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: tokenFor(rawTrip, Date.now() + 60_000) });
+ok(r.status === 410, 'token from the future -> 410', r.status);
+
+// ---------------------------------------------------------------- qr tokens (whole-day mode)
+console.log('\n[qr token: whole day]');
+r = await call(admin, 'PUT', '/api/admin/settings', { qr_mode: 'day' }, csrf);
+ok(r.status === 200 && r.data.qrMode === 'day', 'admin switches QR to whole day');
+let q = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+ok(q.mode === 'day' && /\/checkin\/12\?t=d/.test(q.url) && q.validUntil > Date.now() + 1000, 'day QR is a per-bus code valid until midnight', JSON.stringify({ mode: q.mode, url: q.url }));
+const dayTok = q.token;
+r = await call(jar(), 'POST', '/api/checkin/session', { token: dayTok, bus: '12' });
+ok(r.status === 200 && r.data.trip.id === trip.id, "today's QR opens the running trip");
+const q2 = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+ok(q2.token === dayTok, 'day QR stays the same between refreshes');
+r = await call(jar(), 'POST', '/api/checkin/session', { token: await dayTokenFor(bus12.id, Date.now() - 86_400_000) });
+ok(r.status === 410, "yesterday's QR -> 410", r.status);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: dayTok.slice(0, -2) + 'zz' });
+ok(r.status === 410, 'tampered day QR -> 410', r.status);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: await dayTokenFor(otherBus.id) });
+ok(r.status === 409 && r.data.code === 'NO_TRIP', 'day QR of a bus with no running trip -> NO_TRIP', r.status);
+r = await call(admin, 'POST', `/api/incharge/trips/${trip.id}/new-qr`, {}, csrf);
+ok(r.status === 200, 'New QR code');
+r = await call(jar(), 'POST', '/api/checkin/session', { token: dayTok });
+ok(r.status === 410, 'old day QR stops working after New QR code', r.status);
+q = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+r = await call(jar(), 'POST', '/api/checkin/session', { token: q.token });
+ok(q.token !== dayTok && r.status === 200, 'the new day QR works');
+r = await call(admin, 'PUT', '/api/admin/settings', { qr_mode: 'rotating' }, csrf);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: q.token });
+ok(r.status === 410, 'switching back to rotating cancels day QRs', r.status);
+
+console.log('\n[qr token: per trip, N hours]');
+r = await call(admin, 'PUT', '/api/admin/settings', { qr_mode: 'trip', qr_trip_hours: 2 }, csrf);
+ok(r.status === 200 && r.data.qrMode === 'trip' && r.data.qrTripHours === 2, 'admin switches to one QR per trip, 2 hours', JSON.stringify(r.data));
+q = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+ok(q.mode === 'trip' && /\/checkin\/12\?t=t/.test(q.url) && !q.expired && q.validUntil > Date.now() && q.validUntil <= Date.now() + 2 * 3_600_000 + 5000, 'trip QR is valid until 2 hours after its window start', JSON.stringify({ url: q.url, validUntil: q.validUntil }));
+const tripTok = q.token;
+r = await call(jar(), 'POST', '/api/checkin/session', { token: tripTok, bus: '12' });
+ok(r.status === 200 && r.data.trip.id === trip.id, 'the trip QR opens this trip');
+r = await call(jar(), 'POST', '/api/checkin/session', { token: tripTok.slice(0, -2) + 'zz' });
+ok(r.status === 410, 'tampered trip QR -> 410', r.status);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: `t${trip.id}.${Number(tripTok.split('.')[1]) + 1}.${tripTok.split('.')[2]}` });
+ok(r.status === 410, 'trip QR with a moved start time -> 410', r.status);
+// pretend the trip started 2.5 hours ago (the window starts at the trip start until "New QR code");
+// under the 4-hour trip limit, so the trip itself keeps running (run this test outside 00:00-02:30 India time)
+const realStart = (await get('SELECT started_at FROM trips WHERE id = ?', trip.id)).started_at;
+await run('UPDATE trips SET started_at = ? WHERE id = ?', realStart - 2.5 * 3_600_000, trip.id);
+q = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+r = await call(jar(), 'POST', '/api/checkin/session', { token: q.token });
+ok(q.expired && r.status === 410, 'after 2 hours the trip QR is expired and refused', JSON.stringify({ expired: q.expired, status: r.status }));
+r = await call(admin, 'POST', `/api/incharge/trips/${trip.id}/new-qr`, {}, csrf);
+ok(r.status === 200, 'New QR code on the trip');
+q = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}/qr`)).data;
+r = await call(jar(), 'POST', '/api/checkin/session', { token: q.token });
+ok(!q.expired && q.validUntil > Date.now() + 2 * 3_600_000 - 60_000 && r.status === 200, 'the new trip QR works for another 2 hours', JSON.stringify({ expired: q.expired }));
+r = await call(jar(), 'POST', '/api/checkin/session', { token: tripTok });
+ok(r.status === 410, 'the earlier trip QR stops working after New QR code', r.status);
+await run('UPDATE trips SET started_at = ? WHERE id = ?', realStart, trip.id);
+r = await call(admin, 'PUT', '/api/admin/settings', { qr_mode: 'day' }, csrf);
+r = await call(jar(), 'POST', '/api/checkin/session', { token: q.token });
+ok(r.status === 410, 'switching to whole-day mode cancels trip QRs', r.status);
+await call(admin, 'PUT', '/api/admin/settings', { qr_mode: ORIGINAL_QR_MODE }, csrf);
+
+const scan = async (j) => call(j, 'POST', '/api/checkin/session', { token: await freshToken() });
+// verify, taking the selfie when the server asks for one (students with no photo yet)
+const verifyId = async (j, id) => {
+  const v = await call(j, 'POST', '/api/checkin/verify', { id });
+  return v.status === 200 && v.data.needsPhoto ? call(j, 'POST', '/api/checkin/verify', { id, photo: SELFIE }) : v;
+};
+const board = async (j, [uuid]) => {
+  await scan(j);
+  return verifyId(j, uuid);
+};
+
+// ---------------------------------------------------------------- identity
+console.log('\n[identity]');
+const d1 = jar();
+r = await scan(d1);
+ok(r.status === 200 && r.data.trip.bus_number === '12', 'live token -> session');
+r = await call(d1, 'POST', '/api/checkin/verify', { id: 'NOT-A-STUDENT-1' });
+ok(r.status === 404 && r.data.code === 'NO_MATCH', 'unknown ID -> student not found', r.status);
+r = await call(d1, 'POST', '/api/checkin/verify', {});
+ok(r.status === 400, 'missing ID -> 400', r.status);
+
+// ---------------------------------------------------------------- anti-proxy (+ live events)
+console.log('\n[anti-proxy & live events]');
+// an incharge of another bus, to prove they do not receive bus 12's events
+r = await call(admin, 'POST', '/api/admin/users', { username: 'testinchargex', name: 'Test Incharge X', role: 'incharge', bus_id: otherBus.id, password: 'TempInchargeX1' }, csrf);
+const otherInchargeId = r.data.id;
+const inchX = jar();
+r = await call(inchX, 'POST', '/api/auth/login', { username: 'testinchargex', password: 'TempInchargeX1' });
+const cursorOf = async (j) => (await call(j, 'GET', '/api/events/poll?after=0')).data?.cursor; // what browsers send first
+r = await call(admin, 'GET', '/api/events/poll?after=0');
+ok(r.status === 200 && Number.isInteger(r.data.cursor), 'poll: first request (after=0) returns a cursor', r.status);
+r = await call(admin, 'GET', '/api/events/poll?after=abc');
+ok(r.status === 400, 'poll: garbage cursor rejected', r.status);
+const [cA, cI, cX] = [await cursorOf(admin), await cursorOf(inch), await cursorOf(inchX)];
+r = await call(d1, 'POST', '/api/checkin/verify', { id: ` ${S.aditi[0].toLowerCase()} ` });
+ok(r.status === 200 && r.data.needsPhoto && r.data.student.name === S.aditi[1] && !r.data.boardedAt, 'no photo on record -> asks for a selfie first, nothing recorded yet', JSON.stringify(r.data));
+r = await call(d1, 'POST', '/api/checkin/verify', { id: S.aditi[0], photo: 'data:image/png;base64,iVBORw0KGgo=' });
+ok(r.status === 400 && r.data.code === 'BAD_PHOTO', 'a non-JPEG or tiny "photo" is refused', r.status);
+r = await call(d1, 'POST', '/api/checkin/verify', { id: ` ${S.aditi[0].toLowerCase()} `, photo: SELFIE });
+ok(r.status === 200 && r.data.ok && !r.data.already && r.data.flags.length === 0, 'phone D1 verifies Aditi with her selfie (messy case/spacing)', JSON.stringify(r.data));
+ok(r.data.student?.uuid === S.aditi[0] && r.data.student.name === S.aditi[1] && r.data.student.stop && r.data.trip.bus_number === '12', 'card details come from the database');
+const aditiPhoto = r.data.student?.photo_url || '';
+ok(/^\/api\/photos\/\d+\?v=\d+$/.test(aditiPhoto), 'the selfie is kept as her photo', aditiPhoto);
+let ph = await fetch(BASE + aditiPhoto, { headers: admin.headers() });
+ok(ph.status === 200 && ph.headers.get('content-type') === 'image/jpeg' && (await ph.arrayBuffer()).byteLength === 3004, 'staff can load the stored selfie', ph.status);
+ph = await fetch(BASE + aditiPhoto, { headers: d1.headers() });
+ok(ph.status === 200, "the student's own phone can load it", ph.status);
+ph = await fetch(BASE + aditiPhoto);
+ok(ph.status === 403, 'anyone else cannot', ph.status);
+if (LIVE === 'poll') {
+  const seen = async (j, c) => (await call(j, 'GET', `/api/events/poll?after=${c}`)).data.events.filter((e) => e.type === 'checkin').map((e) => e.data.checkin.uuid);
+  ok((await seen(admin, cA)).includes(S.aditi[0]), 'poll: admin receives the boarding event');
+  ok((await seen(inch, cI)).includes(S.aditi[0]), 'poll: bus 12 incharge receives the boarding event');
+  ok(!(await seen(inchX, cX)).includes(S.aditi[0]), "poll: another bus's incharge does not receive it");
+  const again = await call(admin, 'GET', `/api/events/poll?after=${(await call(admin, 'GET', `/api/events/poll?after=${cA}`)).data.cursor}`);
+  ok(again.status === 200 && again.data.events.length === 0, 'poll: cursor advances, no duplicates');
+} else {
+  r = await call(admin, 'GET', '/api/events/poll');
+  ok(r.status === 200 && typeof r.data.cursor === 'number', 'poll endpoint answers in SSE mode too');
+}
+await call(admin, 'DELETE', `/api/admin/users/${otherInchargeId}`, undefined, csrf);
+r = await call(d1, 'POST', '/api/checkin/verify', { id: S.aditi[0] });
+ok(r.status === 200 && r.data.already && r.data.student.uuid === S.aditi[0], 'pressing Verify twice -> already verified card');
+r = await board(d1, S.rahul);
+ok(r.status === 403 && r.data.code === 'DEVICE_USED', 'phone D1 tries a second student on same trip -> blocked', r.status);
+const d2 = jar();
+const dups0 = (await call(admin, 'GET', `/api/incharge/trips/${trip.id}`)).data.counts.duplicates;
+r = await board(d2, S.aditi);
+ok(r.status === 200 && r.data.already, 'phone D2 tries Aditi again -> already verified', JSON.stringify(r.data));
+r = await call(admin, 'GET', `/api/incharge/trips/${trip.id}`);
+ok(r.data.counts.duplicates === dups0 + 1, 'the repeat scan is counted as a duplicate', JSON.stringify(r.data.counts));
+r = await board(d2, S.priya);
+ok(r.status === 200 && r.data.flags.length === 0, 'phone D2 boards Priya, no flags');
+r = await board(jar(), S.tanvi);
+ok(r.status === 404 && r.data.code === 'NO_MATCH' && /not found for Bus 12/.test(r.data.error), 'student of another bus scanning bus 12 -> not found for this bus', JSON.stringify(r.data));
+r = await call(admin, 'POST', `/api/incharge/trips/${trip.id}/manual`, { uuid: S.tanvi[0] }, csrf);
+ok(r.status === 409 && r.data.code === 'NOT_ON_BUS', 'manual check-in of another bus student -> refused', r.status);
+r = await call(inch, 'GET', `/api/incharge/students/search?q=${encodeURIComponent(S.tanvi[1].split(' ')[0])}&bus=${otherBus.id}`);
+ok(r.status === 200 && r.data.items.every((s) => s.bus_number === '12'), 'bus admin search only ever returns students of their own bus');
+r = await call(admin, 'POST', `/api/incharge/trips/${trip.id}/end`, {}, csrf);
+ok(r.status === 200, 'end trip 1');
+r = await call(d1, 'POST', '/api/checkin/verify', { id: S.aditi[0] });
+ok(r.status === 410, 'check-in session dies when trip ends', r.status);
+r = await call(admin, 'POST', '/api/incharge/trips', { bus_id: bus12.id, direction: 'to_college' }, csrf);
+trip = r.data.trip;
+ok(r.status === 201, 'start trip 2');
+r = await board(d1, S.priya);
+ok(r.status === 403 && r.data.code === 'DEVICE_BOUND', "D1 (Aditi's phone) tries Priya on a new trip -> blocked", r.status);
+await scan(d1);
+r = await call(d1, 'POST', '/api/checkin/verify', { id: S.aditi[0] });
+ok(r.status === 200 && !r.data.needsPhoto && r.data.flags.length === 0, 'D1 boards Aditi again on the new trip, no selfie needed now', JSON.stringify(r.data));
+ok(r.data.student?.photo_url === aditiPhoto, 'her stored selfie is on the card');
+r = await board(jar(), S.priya);
+ok(r.status === 200 && r.data.flags.includes('new_device'), 'Priya on a 2nd phone -> allowed but flagged new_device', JSON.stringify(r.data));
+await call(admin, 'POST', `/api/incharge/trips/${trip.id}/end`, {}, csrf);
+r = await call(admin, 'POST', '/api/incharge/trips', { bus_id: bus12.id, direction: 'from_college' }, csrf);
+trip = r.data.trip;
+r = await board(jar(), S.priya);
+ok(r.status === 403 && r.data.code === 'TOO_MANY_DEVICES', 'Priya on a 3rd phone -> blocked until admin reset', r.status);
+r = await call(admin, 'POST', `/api/admin/students/${ids.priya}/devices/reset`, {}, csrf);
+ok(r.status === 200 && r.data.unlinked === 2, 'admin resets Priya devices');
+r = await board(jar(), S.priya);
+ok(r.status === 200, 'Priya boards after reset');
+
+// ---------------------------------------------------------------- forgotten trips
+console.log('\n[forgotten trips end by themselves]');
+r = await call(admin, 'POST', '/api/incharge/trips', { bus_id: otherBus.id, direction: 'to_college' }, csrf);
+const oldTrip = r.data.trip;
+ok(r.status === 201, `start a trip on bus ${otherBus.number}`);
+await run('UPDATE trips SET started_at = ? WHERE id = ?', Date.now() - 5 * 3_600_000, oldTrip.id);
+const ended = await autoEndStaleTrips();
+r = await call(admin, 'GET', `/api/admin/trips/${oldTrip.id}`);
+ok(ended.includes(oldTrip.id) && r.data.trip.status === 'ended' && r.data.trip.ended_at <= r.data.trip.started_at + 4 * 3_600_000, 'a trip left running past 4 hours is ended at its limit', JSON.stringify({ ended, status: r.data?.trip?.status }));
+r = await call(admin, 'GET', `/api/incharge/state?bus=${encodeURIComponent(otherBus.number)}`);
+ok(r.status === 200 && !r.data.activeTrips.some((t) => t.id === oldTrip.id), 'its bus shows no running trip, so the next trip starts fresh');
+r = await call(admin, 'POST', '/api/incharge/trips', { bus_id: otherBus.id, direction: 'from_college' }, csrf);
+ok(r.status === 201 && r.data.trip.id !== oldTrip.id, 'the evening trip is a new trip (morning and evening verifications kept apart)');
+await call(admin, 'POST', `/api/incharge/trips/${r.data.trip.id}/end`, {}, csrf);
+ok((await autoEndStaleTrips()).length === 0, 'trips within their hours are left running');
+
+// ---------------------------------------------------------------- brute force
+console.log('\n[brute force limits]');
+const d6 = jar();
+await scan(d6);
+let last;
+for (let i = 0; i < 7; i++) last = await call(d6, 'POST', '/api/checkin/verify', { id: `GUESS${100 + i}` });
+ok(last.status === 429 && last.data.code === 'LOOKUPS_EXHAUSTED', 'ID guessing stops after 6 tries per scan', last.status);
+r = await call(admin, 'POST', '/api/admin/users', { username: 'locktest', name: 'Lock Test', role: 'incharge', password: 'LockTest12345' }, csrf);
+const lockId = r.data.id;
+for (let i = 0; i < 5; i++) await call(jar(), 'POST', '/api/auth/login', { username: 'locktest', password: 'wrong-pass-1' });
+r = await call(jar(), 'POST', '/api/auth/login', { username: 'locktest', password: 'LockTest12345' });
+// 423 = per-account lockout; 429 = the per-network login limiter got there first (repeated runs). Both block.
+ok(r.status === 423 || r.status === 429, `account locks after 5 bad passwords, even with the right one next${r.status === 429 ? ' (network limiter hit first)' : ''}`, r.status);
+await call(admin, 'DELETE', `/api/admin/users/${lockId}`, undefined, csrf);
+
+// ---------------------------------------------------------------- manual, data, headers
+console.log('\n[manual check-in & data]');
+r = await call(admin, 'POST', `/api/incharge/trips/${trip.id}/manual`, { uuid: S.arjun[0], note: 'phone dead' }, csrf);
+ok(r.status === 201 && r.data.flags.includes('manual'), 'manual check-in flagged manual');
+r = await call(admin, 'GET', `/api/admin/trips/${trip.id}`);
+ok(r.status === 200 && r.data.counts.boarded === 2 && r.data.checkins.some((c) => c.method === 'manual'), 'trip summary counts 2 boarded (Priya + manual)', JSON.stringify(r.data.counts));
+const res = await fetch(`${BASE}/api/admin/trips/${trip.id}/export.csv`, { headers: admin.headers() });
+const csv = await res.text();
+ok(res.status === 200 && csv.startsWith('uuid,name') && csv.includes(S.priya[0]) && csv.includes('phone dead'), 'trip CSV export');
+
+// day report, enrollment numbers and the Excel workbook layout
+r = await call(admin, 'GET', '/api/admin/today');
+const b12today = r.data?.buses?.find((b) => b.number === '12');
+ok(r.status === 200 && b12today && b12today.verified >= 2 && b12today.duplicates >= 1 && r.data.verified.some((c) => c.uuid === S.priya[0]) && r.data.duplicates.length >= 1, "day report: bus 12 verified count, duplicates and today's list", JSON.stringify(b12today));
+const rep1 = await fetch(`${BASE}/api/admin/today/export.csv`, { headers: admin.headers() });
+const repCsv = await rep1.text();
+ok(rep1.status === 200 && repCsv.startsWith('time,uuid,enrollment_no,name') && repCsv.includes('DUPLICATE'), 'day report CSV');
+r = await call(admin, 'POST', '/api/admin/students/import', { rows: [['UUID', 'Name', 'PhotoURL', 'Route', 'BusNo', 'Course', 'EnrollmentNo', 'Active'], ['TEST002', 'Excel Test', 'https://example.com/p.jpg', '01 Test Crossing', '12', 'BCA', 'ENR-TEST-002', 'TRUE'], ['TEST003', 'Inactive Test', '', '', '12', '', '', 'FALSE']] }, csrf);
+ok(r.status === 200 && r.data.inserted + r.data.updated === 2 && r.data.inactive === 1, 'Excel-layout import (Route = pickup point, Active column)', JSON.stringify(r.data));
+const xl = (await call(admin, 'GET', '/api/admin/students?q=TEST002')).data.items[0];
+ok(xl && xl.enrollment_no === 'ENR-TEST-002' && xl.photo_url === 'https://example.com/p.jpg' && xl.stop_name === '01 Test Crossing' && xl.bus_number === '12', 'imported photo, enrollment number and route', JSON.stringify(xl));
+if (xl) await call(admin, 'POST', `/api/admin/students/${xl.id}/devices/reset`, {}, csrf); // repeatable runs
+r = await board(jar(), ['enr-test-002']);
+ok(r.status === 200 && r.data.student?.uuid === 'TEST002' && r.data.student.photo_url, 'student verifies with their enrollment number', JSON.stringify(r.data));
+r = await board(jar(), ['TEST003']);
+ok(r.status === 404, 'inactive student cannot verify', r.status);
+for (const q of ['TEST002', 'TEST003']) { const x = (await call(admin, 'GET', `/api/admin/students?q=${q}`)).data.items[0]; if (x) await call(admin, 'DELETE', `/api/admin/students/${x.id}`, undefined, csrf); }
+r = await call(admin, 'POST', '/api/admin/import/workbook', { buses: [{ number: 'WB-1', route: 'Workbook route', active: 'TRUE' }], incharges: [{ id: 'IC-WB1', name: 'Workbook Incharge', bus: 'WB-1', active: 'TRUE', role: 'INCHARGE' }, { id: 'UU-ADMIN', name: 'Admin row', bus: 'ALL', role: 'ADMIN' }], students: [] }, csrf);
+ok(r.status === 200 && r.data.buses.created + r.data.buses.updated === 1 && (r.data.incharges.created.length === 1 ? r.data.incharges.created[0].password.length >= 10 : r.data.incharges.updated === 1), 'workbook import: bus and incharge account (password shown once), ADMIN row ignored', JSON.stringify(r.data));
+const staffNow = (await call(admin, 'GET', '/api/admin/users')).data.items;
+const wbUser = staffNow.find((u) => u.username === 'IC-WB1');
+ok(wbUser && wbUser.role === 'incharge' && wbUser.bus_number === 'WB-1' && !staffNow.some((u) => u.username === 'UU-ADMIN'), 'incharge linked to its bus; no admin account created from the sheet');
+if (wbUser) await call(admin, 'DELETE', `/api/admin/users/${wbUser.id}`, undefined, csrf);
+const wbBus = (await call(admin, 'GET', '/api/admin/buses')).data.buses.find((b) => b.number === 'WB-1');
+if (wbBus) await call(admin, 'DELETE', `/api/admin/buses/${wbBus.id}`, undefined, csrf);
+r = await call(admin, 'POST', '/api/admin/import/workbook', { buses: [] });
+ok(r.status === 403 && r.data.code === 'CSRF', 'workbook import needs the CSRF token', r.status);
+
+r = await call(admin, 'POST', '/api/admin/students/import', { csv: 'uuid,name,course,year,bus,stop\nTEST001,Import Test,BCA,1st,99,New Stop' }, csrf);
+ok(r.status === 200 && r.data.inserted + r.data.updated === 1, 'CSV import', JSON.stringify(r.data));
+const imported = (await call(admin, 'GET', '/api/admin/students?q=TEST001')).data.items[0];
+ok(imported && imported.bus_number === '99' && imported.stop_name === 'New Stop', 'imported student linked to bus/stop');
+await call(admin, 'DELETE', `/api/admin/students/${imported.id}`, undefined, csrf);
+const b99 = (await call(admin, 'GET', '/api/admin/buses')).data.buses.find((b) => b.number === '99');
+if (b99) await call(admin, 'DELETE', `/api/admin/buses/${b99.id}`, undefined, csrf);
+r = await call(admin, 'GET', '/api/admin/audit');
+ok(r.status === 200 && r.data.items.some((a) => a.action === 'checkin.manual') && r.data.items.some((a) => a.action === 'login.failed'), 'audit log records manual check-in and failed logins');
+r = await call(admin, 'POST', `/api/incharge/trips/${trip.id}/end`, {}, csrf);
+ok(r.status === 200, 'end trip 3');
+console.log('\n[operations admin: view only]');
+r = await call(admin, 'POST', '/api/admin/users', { username: 'testoperator', name: 'Test Operator', role: 'operator', password: 'OperatorPass123' }, csrf);
+ok(r.status === 201, 'super admin creates an operations admin', JSON.stringify(r.data));
+const testOperatorId = r.data.id;
+const op = jar();
+r = await call(op, 'POST', '/api/auth/login', { username: 'testoperator', password: 'OperatorPass123' });
+ok(r.status === 200 && r.data.user.role === 'operator' && r.data.user.readOnly && r.data.user.home === '/admin' && !r.data.user.mustChangePassword, 'operations admin signs in to the console, read-only');
+const ocsrf = { 'X-CSRF-Token': r.data?.csrf, Origin: BASE };
+for (const p of ['/api/admin/dashboard', '/api/admin/students', '/api/admin/buses', '/api/admin/trips', `/api/admin/trips/${trip.id}`, '/api/admin/flags', '/api/incharge/buses', `/api/incharge/state?bus=${encodeURIComponent(otherBus.number)}`, `/api/incharge/trips/${trip.id}`]) {
+  r = await call(op, 'GET', p);
+  ok(r.status === 200, `operations admin can view ${p.split('?')[0]}`, r.status);
+}
+for (const p of ['/api/admin/users', `/api/admin/users/${testInchargeId}/password`, '/api/admin/audit', '/api/admin/settings', '/api/admin/students/export.csv', `/api/incharge/trips/${trip.id}/qr`]) {
+  r = await call(op, 'GET', p);
+  ok(r.status === 403, `operations admin cannot open ${p}`, r.status);
+}
+const writes = [
+  ['POST', '/api/admin/buses', { number: 'OPX', name: 'x' }], ['POST', '/api/admin/import/workbook', {}], ['PUT', '/api/admin/settings', { qr_mode: 'rotating' }],
+  ['POST', '/api/admin/students', { uuid: 'X1', name: 'Xx Yy' }], ['POST', '/api/incharge/trips', { bus_id: otherBus.id, direction: 'to_college' }],
+  ['POST', `/api/incharge/trips/${trip.id}/end`, {}], ['POST', `/api/incharge/trips/${trip.id}/manual`, { uuid: S.rahul[0] }],
+  ['POST', `/api/incharge/trips/${trip.id}/new-qr`, {}], ['POST', '/api/auth/change-password', { current: 'OperatorPass123', next: 'OperatorPass456' }],
+];
+for (const [m, p, body] of writes) {
+  r = await call(op, m, p, body, ocsrf);
+  ok(r.status === 403, `operations admin cannot ${m} ${p}`, r.status);
+}
+r = await call(op, 'GET', '/api/events/poll?after=0');
+ok(r.status === 200 && Number.isInteger(r.data.cursor), 'operations admin receives live updates');
+r = await call(op, 'GET', `/api/incharge/state?bus=${encodeURIComponent(otherBus.number)}`);
+ok(r.status === 200, 'operations admin can open any bus portal to watch it', r.status);
+await call(admin, 'DELETE', `/api/admin/users/${testOperatorId}`, undefined, csrf);
+
+await call(admin, 'DELETE', `/api/admin/users/${testInchargeId}`, undefined, csrf);
+
+console.log('\n[headers]');
+const h = await fetch(`${BASE}/login`);
+ok(/img-src [^;]*https:/.test(h.headers.get('content-security-policy') || ''), 'student photos allowed from https links only');
+ok(h.headers.get('content-security-policy')?.includes("script-src 'self'"), 'strict CSP present');
+ok(h.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"), 'clickjacking protection');
+ok(!h.headers.get('x-powered-by'), 'no x-powered-by');
+
+console.log(`\n${pass} passed, ${fail} failed`);
+process.exit(fail ? 1 : 0);
